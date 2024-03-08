@@ -1,0 +1,402 @@
+---
+title: "Assignment 2"
+author: "Andreas"
+date: "2024-02-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# packages
+library(tidyverse)
+library(patchwork)
+set.seed(1983)
+library(cmdstanr)
+#install.packages("posterior")
+library(posterior)
+library(boot)
+
+```
+
+
+
+Implement agents to generate data
+
+```{r}
+# Random agent with bias
+RandomAgent_f <- function(rate){
+  choice <- rbinom(1, 1, rate)
+  return(choice)
+}
+
+
+# Reinforcement-learning agent with learning rate a
+# Expected Value (EV) is a single number describing a preference for 0 or 1 by being smaller than
+# or larger than 0.5.
+RLAgent_f <- function(prevChoice, Feedback, prev_EV, a){
+  others_prevChoice = ifelse(Feedback == 1, prevChoice, 1 - prevChoice)
+  PE = others_prevChoice - prev_EV
+  EV = prev_EV + a * PE
+  #rate = inv.logit(EV - 0.5) # Subtracting 0.5 in
+  rate = EV
+  choice = rbinom(1,1,rate)
+  return(list(choice = choice, EV = EV))
+}
+```
+
+Environment
+```{r}
+trials = 120
+```
+
+Generate a single game
+
+```{r Generate single game}
+# RL against random biased
+
+# empty arrays to fill
+Self <- rep(NA, trials)
+Other <- rep(NA, trials)
+EV <- rep(NA, trials)
+
+# bias for the random agents
+rate <- 0.75
+
+#learning rate
+a <- 0.3
+
+# First round is random for the RL agent, and expected value is "neutral"
+Self[1] <- RandomAgent_f(0.5)
+Other[1] <- RandomAgent_f(rate)
+EV[1] <- 0.5
+
+
+for (i in 2:trials) {
+  if (Self[i - 1] == Other[i - 1]) {
+    Feedback = 1
+  } else {Feedback = 0}
+  temp <- RLAgent_f(prevChoice = Self[i - 1], Feedback, EV[i - 1], a)
+  Self[i] <- temp$choice
+  EV[i] <- temp$EV
+  Other[i] <- RandomAgent_f(rate)
+}
+
+
+df <- tibble(Self, Other, trial = seq(trials), Feedback = as.numeric(Self == Other), EV)
+
+df %>% ggplot(aes(x = trial, y = Other)) +
+  geom_line(color = "red") +
+  geom_line(aes(x=trial, y=Self), color="blue") +
+  #geom_line(aes(x=trial, y=EV), color="blue") +
+  xlim(0,120)
+  
+```
+
+###### Fit Stan model ######
+
+We try to fit the Stan model to this single game just to see if it works
+
+```{r}
+file = file.path("C:/Users/andre/OneDrive - Aarhus universitet/Cognitive Science/Kandidat/Advanced Cognitive Modeling/Assignments/Ass2/ass_2_RL_model_v2.stan")
+
+mod = cmdstan_model(file)
+
+data <- list(n = trials, choice = df$Self, feedback = df$Feedback)
+
+samples <- mod$sample(
+  data = data,
+  seed = 123,
+  chains = 3,
+  iter_warmup = 1000,
+  iter_sampling = 2000,
+  refresh = 0,
+  max_treedepth = 10,
+  adapt_delta = 0.80
+)
+
+samples$summary()
+
+# Mean of the posterior of learningRate is 0.286
+# True learningRate was 0.3.
+```
+
+###### Model Quality Visualizations ######
+
+- Prior-Posterior Update Check
+
+- Posterior Predictive check
+
+- Prior Predictive Check
+
+```{r}
+draws <- as_draws_df(samples$draws())
+
+
+# Plot Prior Posterior update check
+draws %>%
+  ggplot() +
+  geom_density(aes(x=learningRate_prior), color = "blue", fill = "blue", alpha = 0.2) +
+  geom_density(aes(x=learningRate), color = "red", fill = "red", alpha = 0.2) +
+  geom_vline(xintercept = 0.3) +
+  xlab("Learning Rate") +
+  ylab("Density") +
+  ggtitle("Prior (blue) Posterior (red) Update Check") +
+  theme_minimal()
+
+
+
+# Plot Posterior Predictive check
+posterior_preds <- draws %>% select(starts_with("post_pred"))
+
+mean_post_EVs = rep(NA, trials)
+columns = colnames(posterior_preds)
+
+for(i in 1:trials){
+  colname = columns[i]
+  mean_post_EVs[i] <- mean(posterior_preds[[colname]])
+}
+
+post_pred_check <- tibble(trial = 1:trials, mean_post_EVs, Other)
+post_pred_check %>%
+  ggplot() +
+  geom_line(aes(x=trial, y = Other), color = "red") +
+  geom_line(aes(x=trial, y=mean_post_EVs), color = "blue") +
+  xlab("Trial") +
+  ylab("EV and Other's choice") +
+  labs(title = "Posterior Predictive Check",
+       subtitle =  "Mean EV (blue) as response to other's choice (red) predicted by posterior distribution") +
+  theme_minimal()
+  
+
+
+
+# Plot Prior Predictive check
+prior_preds <- draws %>% select(starts_with("prior_pred"))
+
+mean_prior_EVs = rep(NA, trials)
+columns = colnames(prior_preds)
+
+for(i in 1:trials){
+  colname = columns[i]
+  mean_prior_EVs[i] <- mean(prior_preds[[colname]])
+}
+
+prior_pred_check <- tibble(trial = 1:trials, mean_prior_EVs, Other)
+prior_pred_check %>%
+  ggplot() +
+  geom_line(aes(x=trial, y = Other), color = "red") +
+  geom_line(aes(x=trial, y=mean_prior_EVs), color = "blue") +
+  xlab("Trial") +
+  ylab("EV and Other's choice") +
+  labs(title = "Prior Predictive Check",
+       subtitle =  "Mean EV (blue) as response to other's choice (red) predicted by prior distribution") +
+  theme_minimal()
+
+
+
+
+```
+
+The two PP-checks look very similar, so we plot the predictions of EV against each other to see if they are identical
+
+```{r}
+test_df <- tibble(prior = prior_pred_check$mean_prior_EVs, posterior = post_pred_check$mean_post_EVs)
+
+test_df %>% ggplot(aes(x=prior, y=posterior)) +
+  geom_point() + theme_minimal() + xlab("Prior prediction") + ylab("Posterior prediction") + ggtitle("Prior and Posterior predictions of EV")
+```
+
+
+######## Parameter Recovery ########
+
+Environment
+```{r}
+trials <- 120
+n_recov <- 100
+```
+
+
+The parameter recovery
+
+```{r}
+true_learningRate <- rep(NA, n_recov)
+infer_learningRate <- rep(NA, n_recov)
+infer_q5 <- rep(NA, n_recov)
+infer_q95 <- rep(NA, n_recov)
+
+rate <- 0.75
+
+# Loop over number of recoveries
+
+for(r in 1:n_recov){
+  
+  # sample a true learning rate from unif distr
+  a <- runif(1, 0, 1)
+  true_learningRate[r] <- a
+  
+  # empty arrays to fill
+  Self <- rep(NA, trials)
+  Other <- rep(NA, trials)
+  EV <- rep(NA, trials)
+  
+  # Simulate data
+  Self[1] <- RandomAgent_f(0.5)
+  Other[1] <- RandomAgent_f(rate)
+  EV[1] <- 0.5
+  
+  
+  for (i in 2:trials) {
+    if (Self[i - 1] == Other[i - 1]) {
+      Feedback = 1
+    } else {Feedback = 0}
+    temp <- RLAgent_f(prevChoice = Self[i - 1], Feedback, EV[i - 1], a)
+    Self[i] <- temp$choice
+    EV[i] <- temp$EV
+    Other[i] <- RandomAgent_f(rate)
+  }
+  
+  df <- tibble(Self, Other, trial = seq(trials), Feedback = as.numeric(Self == Other), EV)
+  
+  # Fit Stan model
+  data <- list(n = trials, choice = df$Self, feedback = df$Feedback)
+
+  temp_samples <- mod$sample(
+    data = data,
+    seed = 123,
+    chains = 3,
+    iter_warmup = 1000,
+    iter_sampling = 2000,
+    refresh = 0,
+    max_treedepth = 10,
+    adapt_delta = 0.80
+  )
+  
+  # Record mean of posterior
+  infer_learningRate[r] <- mean(temp_samples$draws(variables = "learningRate"))
+  
+  # Record credible interval
+  infer_q5[r] <- quantile2(temp_samples$draws(variables = "learningRate"))[1]
+  infer_q95[r] <- quantile2(temp_samples$draws(variables = "learningRate"))[2]
+}
+```
+
+
+Visualize recovery
+
+```{r}
+recov_df <- tibble(true_learningRate, infer_learningRate, infer_q5, infer_q95)
+
+recov_df %>% ggplot(aes(true_learningRate, infer_learningRate)) +
+  geom_point(color = "blue", size = 2) +
+  geom_errorbar(aes(ymin = infer_q5, ymax = infer_q95), width = 0) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  ggtitle("Parameter Recovery: Inferred vs. True parameter values") +
+  theme_minimal()
+```
+
+
+##### How many trials do we need for the credible intervals to not overlap? For differences of 0.05 in true learning rate...
+
+
+```{r}
+# The learning rates we want to distinguish between
+learningRate_list <- seq(0.05, 0.95, 0.05)
+
+# The numbers of trials we try
+trial_num_list <- seq(140, 240, 20)
+
+# Bias of random agent
+rate <- 0.75
+
+true_learningRate <- array(NA, dim = c(length(learningRate_list), length(trial_num_list)))
+infer_learningRate <- array(NA, dim = c(length(learningRate_list), length(trial_num_list)))
+infer_q5 <- array(NA, dim = c(length(learningRate_list), length(trial_num_list)))
+infer_q95 <- array(NA, dim = c(length(learningRate_list), length(trial_num_list)))
+
+for(t in 1:length(trial_num_list)){
+  trials = trial_num_list[t]
+  
+  for(l in 1:length(learningRate_list)){
+    a = learningRate_list[l]
+    
+    # Generate the data
+    Self <- rep(NA, trials)
+    Other <- rep(NA, trials)
+    EV <- rep(NA, trials)
+    
+    Self[1] <- RandomAgent_f(0.5)
+    Other[1] <- RandomAgent_f(rate)
+    EV[1] <- 0.5
+    
+    
+    for (i in 2:trials) {
+      if (Self[i - 1] == Other[i - 1]) {
+        Feedback = 1
+      } else {Feedback = 0}
+      temp <- RLAgent_f(prevChoice = Self[i - 1], Feedback, EV[i - 1], a)
+      Self[i] <- temp$choice
+      EV[i] <- temp$EV
+      Other[i] <- RandomAgent_f(rate)
+    }
+    
+    df <- tibble(Self, Other, trial = seq(trials), Feedback = as.numeric(Self == Other), EV)
+  
+    # Fit Stan model
+    data <- list(n = trials, choice = df$Self, feedback = df$Feedback)
+  
+    temp_samples <- mod$sample(
+      data = data,
+      seed = 123,
+      chains = 3,
+      iter_warmup = 1000,
+      iter_sampling = 2000,
+      refresh = 0,
+      max_treedepth = 10,
+      adapt_delta = 0.80
+    )
+    
+    # Record mean of posterior
+    infer_learningRate[l, t] <- mean(temp_samples$draws(variables = "learningRate"))
+    
+    # Record credible interval
+    infer_q5[l, t] <- quantile2(temp_samples$draws(variables = "learningRate"))[1]
+    infer_q95[l, t] <- quantile2(temp_samples$draws(variables = "learningRate"))[2]
+    
+  }
+  
+}
+
+
+```
+
+Plots of the param recov with varying trial numbers
+```{r}
+d = data.frame()
+colnames(df) = c("true_LR", "infer_LR", "q5", "q95", "trials")
+
+for(t in 1:length(trial_num_list)){
+  trials = trial_num_list[t]
+  temp_df = data.frame(true_LR = learningRate_list,
+                       infer_LR = infer_learningRate[,t],
+                       q5 = infer_q5[,t],
+                       q95 = infer_q95[,t],
+                       trials = trials)
+  
+  d = rbind(d, temp_df)
+}
+
+d %>% ggplot(aes(true_LR, infer_LR)) +
+  geom_point(color = "blue", size = 2) +
+  geom_errorbar(aes(ymin = q5, ymax = q95), width = 0) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  ggtitle("Parameter Recovery: Inferred vs. True parameter values") +
+  facet_wrap(~trials) +
+  theme_minimal()
+
+```
+
+
+
