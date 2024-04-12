@@ -1,0 +1,711 @@
+---
+title: "Assignment 3 code"
+author: "Andreas"
+date: "2024-04-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(gtools)
+library(tidyverse)
+library(cmdstanr)
+library(posterior)
+library(loo)
+library(patchwork)
+```
+
+
+Assignment 3
+
+Analyzing real world data from the social conformity experiment
+
+In this markdown
+- Data is simulated (for one participant)
+- Simple Bayes and Weighted Bayes models are fit to the simulated data
+- The models are fitted to the real data (cogsci students, pre-pandemic)
+- Model quality checks
+- Model comparison
+
+
+### Simulate data ###
+
+Define functions to generate the data
+```{r}
+
+simpleBayes_f <- function(ntrials, bias){
+  
+  FirstRating <- floor(runif(n = ntrials, min = 1, max = 9)) #first ratings sampled randomly
+  GroupRating <- floor(runif(n = ntrials, min = 1, max = 9)) #group ratings sampled randomly
+  
+  p_FirstRating <- FirstRating / 9 # Changing ratings to a ]0,1[ space (probability)
+  p_GroupRating <- GroupRating / 9
+  
+  l_FirstRating <- logit(p_FirstRating) # Changing ratings to log-odds space
+  l_GroupRating <- logit(p_GroupRating)
+  
+  l_SecondRating <- bias + l_FirstRating + l_GroupRating # Compute second rating using Simple Bayes
+  
+  SecondRating <- round(inv.logit(l_SecondRating) * 9) # Turn back to original scale
+  
+  SecondRating <- ifelse(SecondRating < 0.5, 1,
+                         ifelse(SecondRating > 8.5, 8, SecondRating)) # Bounded ratings in [1, 8]
+  
+  return(list(FirstRating=FirstRating, GroupRating=GroupRating, SecondRating=SecondRating))
+  
+}
+
+
+weightedBayes_f <- function(ntrials, bias, w1, w2){
+  
+  w1 <- (w1 - 0.5)*2 # Changing waits from literature scale [0.5, 1] to suitable scale [0, 1]
+  w2 <- (w2 - 0.5)*2
+  
+  FirstRating <- floor(runif(n = ntrials, min = 1, max = 9)) #first ratings sampled randomly
+  GroupRating <- floor(runif(n = ntrials, min = 1, max = 9)) #group ratings sampled randomly
+  
+  p_FirstRating <- FirstRating / 9 # Changing ratings to a ]0,1[ space (probability)
+  p_GroupRating <- GroupRating / 9
+  
+  l_FirstRating <- logit(p_FirstRating) # Changing ratings to log-odds space
+  l_GroupRating <- logit(p_GroupRating)
+  
+  l_SecondRating <- bias + l_FirstRating * w1 + l_GroupRating * w2 # Compute second rating using Weighted Bayes
+  
+  SecondRating <- round(inv.logit(l_SecondRating) * 9) # Turn back to original scale
+  
+  SecondRating <- ifelse(SecondRating < 0.5, 1,
+                         ifelse(SecondRating > 8.5, 8, SecondRating)) # Bounded ratings in [1, 8]
+  
+  return(list(FirstRating=FirstRating, GroupRating=GroupRating, SecondRating=SecondRating))
+  
+}
+
+```
+
+
+Environment
+```{r}
+ntrials = 80
+bias = 1
+w1 = 0.7
+w2 = 0.9
+```
+
+
+Inspect the Simple Bayes simulation
+
+```{r}
+data1 <- simpleBayes_f(ntrials, bias)
+
+df1 <- tibble(FirstRating = data1$FirstRating, GroupRating = data1$GroupRating, SecondRating = data1$SecondRating, trial = seq(ntrials))
+
+
+df1 %>% ggplot() +
+  geom_point(aes(trial, FirstRating), color = "Blue") +
+  geom_point(aes(trial, GroupRating), color = "Red") +
+  geom_point(aes(trial, SecondRating), color = "Green") +
+  ggtitle("Simple Bayes sim. Blue = First, Red = Group, Green = Second")
+
+p1 <- df1 %>% ggplot() +
+  geom_point(aes(FirstRating, GroupRating, color = SecondRating)) +
+  ggtitle("Simple Bayes sim. Second rating as function of first and group ratings")
+
+p1 + scale_color_gradient(low = "blue", high = "red")
+
+```
+
+Inspect the weighted Bayes simulation
+
+```{r}
+data2 <- weightedBayes_f(ntrials, bias, w1, w2)
+
+df2 <- tibble(FirstRating = data2$FirstRating, GroupRating = data2$GroupRating, SecondRating = data2$SecondRating, trial = seq(ntrials))
+
+
+df2 %>% ggplot() +
+  geom_point(aes(trial, FirstRating), color = "Blue") +
+  geom_point(aes(trial, GroupRating), color = "Red") +
+  geom_point(aes(trial, SecondRating), color = "Green") +
+  ggtitle("Simple Bayes sim. Blue = First, Red = Group, Green = Second")
+
+
+p2 <- df2 %>% ggplot() +
+  geom_point(aes(FirstRating, GroupRating, color = SecondRating)) +
+  ggtitle("Weighted Bayes sim. Second rating as function of first and group ratings")
+
+p2 + scale_color_gradient(low = "blue", high = "red")
+```
+
+
+
+### Fit models to simulated data ###
+
+
+Simple Bayes model
+```{r}
+file1 = file.path("C:/Users/andre/OneDrive - Aarhus universitet/Cognitive Science/Kandidat/Advanced Cognitive Modeling/Assignments/Ass3/ass_3_simpleBayes.stan")
+
+mod1 = cmdstan_model(file1)
+
+data <- list(n = ntrials,
+             FirstRating = df1$FirstRating,
+             GroupRating = df1$GroupRating,
+             SecondRating = df1$SecondRating)
+
+samples1 <- mod1$sample(
+  data = data,
+  seed = 123,
+  chains = 3,
+  iter_warmup = 1000,
+  iter_sampling = 3000,
+  refresh = 0,
+  max_treedepth = 10,
+  adapt_delta = 0.80
+)
+
+draws1 <- as_draws_df(samples1$draws())
+
+# Plot Prior Posterior update check for bias
+draws1 %>%
+  ggplot() +
+  geom_density(aes(x=bias_prior), color = "blue", fill = "blue", alpha = 0.2) +
+  geom_density(aes(x=bias), color = "red", fill = "red", alpha = 0.2) +
+  geom_vline(xintercept = bias) +
+  xlab("Bias") +
+  ylab("Density") +
+  ggtitle("Prior (blue) Posterior (red) Update Check - Bias") +
+  theme_minimal()
+
+# Plot Prior Posterior update check for error
+draws1 %>%
+  ggplot() +
+  geom_density(aes(x=error_prior), color = "blue", fill = "blue", alpha = 0.2) +
+  geom_density(aes(x=error), color = "red", fill = "red", alpha = 0.2) +
+  geom_vline(xintercept = 0) +
+  xlab("Error") +
+  ylab("Density") +
+  ggtitle("Prior (blue) Posterior (red) Update Check - Error") +
+  theme_minimal()
+
+
+
+# Check chains
+
+draws1 %>% mutate(.chain = as.factor(.chain)) %>%  ggplot() +
+  geom_line(aes(.iteration, bias, color = .chain)) +
+  theme_minimal()
+
+draws1 %>% mutate(.chain = as.factor(.chain)) %>%  ggplot() +
+  geom_line(aes(.iteration, error, color = .chain)) +
+  theme_minimal()
+
+
+```
+
+
+Weighted Bayes model (V1)
+
+Don't run the below chunk, Stan model is not entirely correct
+
+```{r}
+# file2 = file.path("C:/Users/andre/OneDrive - Aarhus universitet/Cognitive Science/Kandidat/Advanced Cognitive Modeling/Assignments/Ass3/ass_3_weightedBayes.stan")
+# 
+# mod2 = cmdstan_model(file2)
+# 
+# data <- list(n = ntrials,
+#              FirstRating = df2$FirstRating,
+#              GroupRating = df2$GroupRating,
+#              SecondRating = df2$SecondRating)
+# 
+# samples2 <- mod2$sample(
+#   data = data,
+#   seed = 123,
+#   chains = 3,
+#   iter_warmup = 1000,
+#   iter_sampling = 3000,
+#   refresh = 0,
+#   max_treedepth = 10,
+#   adapt_delta = 0.80
+# )
+# 
+# draws2 <- as_draws_df(samples2$draws())
+# 
+# # Plot Prior Posterior update check for w1
+# draws2 %>%
+#   ggplot() +
+#   geom_density(aes(x=w1_prior), color = "blue", fill = "blue", alpha = 0.2) +
+#   geom_density(aes(x=w1), color = "red", fill = "red", alpha = 0.2) +
+#   geom_vline(xintercept = w1) +
+#   xlab("w1") +
+#   ylab("Density") +
+#   ggtitle("Prior (blue) Posterior (red) Update Check - w1") +
+#   theme_minimal()
+# 
+# # Plot Prior Posterior update check for logit_w1 (the scale it was sampled on)
+# draws2 %>%
+#   ggplot() +
+#   geom_density(aes(x=logit_w1_prior), color = "blue", fill = "blue", alpha = 0.2) +
+#   geom_density(aes(x=logit_w1), color = "red", fill = "red", alpha = 0.2) +
+#   #geom_vline(xintercept = w1) +
+#   xlab("logit w1") +
+#   ylab("Density") +
+#   ggtitle("Prior (blue) Posterior (red) Update Check - logit w1") +
+#   theme_minimal()
+# 
+# # Plot Prior Posterior update check for w2
+# draws2 %>%
+#   ggplot() +
+#   geom_density(aes(x=w2_prior), color = "blue", fill = "blue", alpha = 0.2) +
+#   geom_density(aes(x=w2), color = "red", fill = "red", alpha = 0.2) +
+#   geom_vline(xintercept = w2) +
+#   xlab("w2") +
+#   ylab("Density") +
+#   ggtitle("Prior (blue) Posterior (red) Update Check - w2") +
+#   theme_minimal()
+# 
+# # Plot Prior Posterior update check for logit_w2 (the scale it was sampled on)
+# draws2 %>%
+#   ggplot() +
+#   geom_density(aes(x=logit_w2_prior), color = "blue", fill = "blue", alpha = 0.2) +
+#   geom_density(aes(x=logit_w2), color = "red", fill = "red", alpha = 0.2) +
+#   #geom_vline(xintercept = w1) +
+#   xlab("logit w2") +
+#   ylab("Density") +
+#   ggtitle("Prior (blue) Posterior (red) Update Check - logit w2") +
+#   theme_minimal()
+# 
+# 
+# # Plot Prior Posterior update check for bias
+# draws2 %>%
+#   ggplot() +
+#   geom_density(aes(x=bias_prior), color = "blue", fill = "blue", alpha = 0.2) +
+#   geom_density(aes(x=bias), color = "red", fill = "red", alpha = 0.2) +
+#   geom_vline(xintercept = bias) +
+#   xlab("Bias") +
+#   ylab("Density") +
+#   ggtitle("Prior (blue) Posterior (red) Update Check - Bias") +
+#   theme_minimal()
+# 
+# # Plot Prior Posterior update check for error
+# draws2 %>%
+#   ggplot() +
+#   geom_density(aes(x=error_prior), color = "blue", fill = "blue", alpha = 0.2) +
+#   geom_density(aes(x=error), color = "red", fill = "red", alpha = 0.2) +
+#   geom_vline(xintercept = 0) +
+#   xlab("Error") +
+#   ylab("Density") +
+#   ggtitle("Prior (blue) Posterior (red) Update Check - Error") +
+#   theme_minimal()
+# 
+# 
+# 
+# # Check chains
+# 
+# draws2 %>% mutate(.chain = as.factor(.chain)) %>%  ggplot() +
+#   geom_line(aes(.iteration, bias, color = .chain)) +
+#   theme_minimal()
+# 
+# draws2 %>% mutate(.chain = as.factor(.chain)) %>%  ggplot() +
+#   geom_line(aes(.iteration, error, color = .chain)) +
+#   theme_minimal()
+# 
+# draws2 %>% mutate(.chain = as.factor(.chain)) %>%  ggplot() +
+#   geom_line(aes(.iteration, w1, color = .chain)) +
+#   theme_minimal()
+# 
+# draws2 %>% mutate(.chain = as.factor(.chain)) %>%  ggplot() +
+#   geom_line(aes(.iteration, w2, color = .chain)) +
+#   theme_minimal()
+
+
+```
+
+
+
+Weighted Bayes Model (V2 - Same output as V1, but parameters specified and transformed in reverse order)
+
+```{r}
+file3 = file.path("C:/Users/andre/OneDrive - Aarhus universitet/Cognitive Science/Kandidat/Advanced Cognitive Modeling/Assignments/Ass3/ass_3_weightedBayes_V2.stan")
+
+mod3 = cmdstan_model(file3)
+
+data <- list(n = ntrials,
+             FirstRating = df2$FirstRating,
+             GroupRating = df2$GroupRating,
+             SecondRating = df2$SecondRating)
+
+samples3 <- mod3$sample(
+  data = data,
+  seed = 123,
+  chains = 3,
+  iter_warmup = 1000,
+  iter_sampling = 3000,
+  refresh = 0,
+  max_treedepth = 10,
+  adapt_delta = 0.80
+)
+
+draws3 <- as_draws_df(samples3$draws())
+
+# Plot Prior Posterior update check for w1
+draws3 %>%
+  ggplot() +
+  geom_density(aes(x=w1_prior), color = "blue", fill = "blue", alpha = 0.2) +
+  geom_density(aes(x=w1_posterior), color = "red", fill = "red", alpha = 0.2) +
+  geom_vline(xintercept = w1) +
+  xlab("w1") +
+  ylab("Density") +
+  ggtitle("Prior (blue) Posterior (red) Update Check - w1") +
+  theme_minimal()
+
+# Plot Prior Posterior update check for logit_w1 (the scale it was sampled on)
+draws3 %>%
+  ggplot() +
+  geom_density(aes(x=logit_w1_prior), color = "blue", fill = "blue", alpha = 0.2) +
+  geom_density(aes(x=logit_w1), color = "red", fill = "red", alpha = 0.2) +
+  #geom_vline(xintercept = w1) +
+  xlab("logit w1") +
+  ylab("Density") +
+  ggtitle("Prior (blue) Posterior (red) Update Check - logit w1") +
+  theme_minimal()
+
+# Plot Prior Posterior update check for w2
+draws3 %>%
+  ggplot() +
+  geom_density(aes(x=w2_prior), color = "blue", fill = "blue", alpha = 0.2) +
+  geom_density(aes(x=w2_posterior), color = "red", fill = "red", alpha = 0.2) +
+  geom_vline(xintercept = w2) +
+  xlab("w2") +
+  ylab("Density") +
+  ggtitle("Prior (blue) Posterior (red) Update Check - w2") +
+  theme_minimal()
+
+# Plot Prior Posterior update check for logit_w2 (the scale it was sampled on)
+draws3 %>%
+  ggplot() +
+  geom_density(aes(x=logit_w2_prior), color = "blue", fill = "blue", alpha = 0.2) +
+  geom_density(aes(x=logit_w2), color = "red", fill = "red", alpha = 0.2) +
+  #geom_vline(xintercept = w1) +
+  xlab("logit w2") +
+  ylab("Density") +
+  ggtitle("Prior (blue) Posterior (red) Update Check - logit w2") +
+  theme_minimal()
+
+
+# Plot Prior Posterior update check for bias
+draws3 %>%
+  ggplot() +
+  geom_density(aes(x=bias_prior), color = "blue", fill = "blue", alpha = 0.2) +
+  geom_density(aes(x=bias), color = "red", fill = "red", alpha = 0.2) +
+  geom_vline(xintercept = bias) +
+  xlab("Bias") +
+  ylab("Density") +
+  ggtitle("Prior (blue) Posterior (red) Update Check - Bias") +
+  theme_minimal()
+
+# Plot Prior Posterior update check for error
+draws3 %>%
+  ggplot() +
+  geom_density(aes(x=error_prior), color = "blue", fill = "blue", alpha = 0.2) +
+  geom_density(aes(x=error), color = "red", fill = "red", alpha = 0.2) +
+  geom_vline(xintercept = 0) +
+  xlab("Error") +
+  ylab("Density") +
+  ggtitle("Prior (blue) Posterior (red) Update Check - Error") +
+  theme_minimal()
+
+
+
+# Check chains
+
+tp1 <- draws3 %>% mutate(.chain = as.factor(.chain)) %>%  ggplot() +
+  geom_line(aes(.iteration, bias, color = .chain)) +
+  theme_minimal()
+
+tp2 <- draws3 %>% mutate(.chain = as.factor(.chain)) %>%  ggplot() +
+  geom_line(aes(.iteration, error, color = .chain)) +
+  theme_minimal()
+
+tp3 <- draws3 %>% mutate(.chain = as.factor(.chain)) %>%  ggplot() +
+  geom_line(aes(.iteration, logit_w1, color = .chain)) +
+  theme_minimal()
+
+tp4 <- draws3 %>% mutate(.chain = as.factor(.chain)) %>%  ggplot() +
+  geom_line(aes(.iteration, logit_w2, color = .chain)) +
+  theme_minimal()
+
+(tp1 + tp2) / (tp3 + tp4)
+
+
+```
+
+### Fit to real data ###
+
+
+Load the data
+```{r}
+cogsci_d <- read_csv("cogsci_clean.csv")
+```
+
+Clean the data
+```{r}
+# Detect ratings below 1 or above 8
+length(cogsci_d$FirstRating[cogsci_d$FirstRating < 1])
+length(cogsci_d$FirstRating[cogsci_d$FirstRating > 8])
+
+length(cogsci_d$SecondRating[cogsci_d$SecondRating < 1])
+length(cogsci_d$SecondRating[cogsci_d$SecondRating > 8])
+
+length(cogsci_d$GroupRating[cogsci_d$GroupRating < 1])
+length(cogsci_d$GroupRating[cogsci_d$GroupRating > 8])
+
+
+# There are 0's in Group ratings. What to do with these?
+
+cogsci_d <- cogsci_d %>% filter(GroupRating > 0)
+
+```
+
+Inspect distribution of second ratings pr participant
+```{r}
+cogsci_d$ID <- as.factor(cogsci_d$ID)
+cogsci_d %>% ggplot() +
+  geom_density(aes(SecondRating, color = ID, fill = ID), alpha = 0.1) +
+  theme_minimal()
+
+# One participant rated 1 most of the times, one almost always rated 5
+```
+
+
+Fit Simple Bayes Model to the real data
+
+```{r}
+IDs <- unique(cogsci_d$ID)
+
+draws_all <- data.frame()
+
+for (ID in IDs){
+  this_ID <- ID # Why the f is this necessary???
+  single_d <- cogsci_d %>% filter(ID == this_ID)
+  
+  temp_data <- list(n = length(single_d$FirstRating),
+                    FirstRating = single_d$FirstRating,
+                    GroupRating = single_d$GroupRating,
+                    SecondRating = single_d$SecondRating)
+
+  temp_samples <- mod1$sample(
+    data = temp_data,
+    seed = 123,
+    chains = 3,
+    iter_warmup = 1000,
+    iter_sampling = 3000,
+    refresh = 0,
+    max_treedepth = 10,
+    adapt_delta = 0.80
+  )
+  
+  temp_draws <- as_draws_df(temp_samples$draws())
+  
+  temp_draws$ID <- ID
+  
+  draws_all <- rbind(draws_all, temp_draws)
+}
+
+```
+
+Plot all the posteriors for Bias and Error
+```{r}
+draws_all$ID <- as.factor(draws_all$ID)
+
+draws_all %>%
+  ggplot() +
+  geom_density(aes(x=bias, color = ID, fill = ID), alpha = 0.2) +
+  xlab("Bias") +
+  ylab("Density") +
+  ggtitle("Bias Posteriors") +
+  theme_minimal()
+
+draws_all %>%
+  ggplot() +
+  geom_density(aes(x=error, color = ID, fill = ID), alpha = 0.2) +
+  xlab("Error") +
+  ylab("Density") +
+  ggtitle("Error Posteriors") +
+  theme_minimal()
+```
+
+
+Fit Weighted Bayes Model to real data
+
+```{r}
+draws_all2 <- data.frame()
+
+for (ID in IDs){
+  this_ID <- ID # Why the f is this necessary???
+  single_d <- cogsci_d %>% filter(ID == this_ID)
+  
+  temp_data <- list(n = length(single_d$FirstRating),
+                    FirstRating = single_d$FirstRating,
+                    GroupRating = single_d$GroupRating,
+                    SecondRating = single_d$SecondRating)
+
+  temp_samples <- mod3$sample(
+    data = temp_data,
+    seed = 123,
+    chains = 3,
+    iter_warmup = 1000,
+    iter_sampling = 3000,
+    refresh = 0,
+    max_treedepth = 10,
+    adapt_delta = 0.80
+  )
+  
+  temp_draws <- as_draws_df(temp_samples$draws())
+  
+  temp_draws$ID <- ID
+  
+  draws_all2 <- rbind(draws_all2, temp_draws)
+}
+```
+
+
+Plot all the posteriors for Bias, Error, w1, and w2
+
+```{r}
+draws_all2$ID <- as.factor(draws_all2$ID)
+
+draws_all2 %>%
+  ggplot() +
+  geom_density(aes(x=bias, color = ID, fill = ID), alpha = 0.2) +
+  xlab("Bias") +
+  ylab("Density") +
+  ggtitle("Bias Posteriors") +
+  theme_minimal()
+
+draws_all2 %>% filter(ID != 27) %>% 
+  ggplot() +
+  geom_density(aes(x=error, color = ID, fill = ID), alpha = 0.2) +
+  xlab("Error") +
+  ylab("Density") +
+  ggtitle("Error Posteriors") +
+  theme_minimal()
+
+draws_all2 %>%
+  ggplot() +
+  geom_density(aes(x=logit_w1, fill = ID), color = "blue", alpha = 0.1) +
+  geom_density(aes(x=logit_w2, fill = ID), color = "red", alpha = 0.1) +
+  xlab("Logit Weight") +
+  ylab("Density") +
+  ggtitle("Logit Weight Posteriors") +
+  theme_minimal()
+
+
+# We plot on the [0.5, 1] scale but remove participant 27, as their posterior for weight is almost exactly 0.5
+
+draws_all2 %>% filter(ID != 27) %>% 
+  ggplot() +
+  geom_density(aes(x=w1_posterior, fill = ID), color = "blue", alpha = 0.1) +
+  geom_density(aes(x=w2_posterior, fill = ID), color = "red", alpha = 0.1) +
+  xlab("Weight") +
+  ylab("Density") +
+  ggtitle("Weight Posteriors") +
+  theme_minimal()
+
+```
+
+
+### Model Comparison ###
+
+In order to compare the two models, we need a single fit for each model. Hence, we fit to the entire dataset.
+
+
+Remove participant 27 to not mess with the weight estimates
+```{r}
+cogsci_d <- cogsci_d %>% filter(ID != 27)
+```
+
+
+Fit the models to the data
+```{r}
+data <- list(n = length(cogsci_d$SecondRating),
+             FirstRating = cogsci_d$FirstRating,
+             GroupRating = cogsci_d$GroupRating,
+             SecondRating = cogsci_d$SecondRating)
+
+simpleBayes_fit <- mod1$sample(
+  data = data,
+  seed = 123,
+  chains = 3,
+  iter_warmup = 1000,
+  iter_sampling = 3000,
+  refresh = 0,
+  max_treedepth = 10,
+  adapt_delta = 0.80
+)
+
+weightedBayes_fit <- mod3$sample(
+  data = data,
+  seed = 123,
+  chains = 3,
+  iter_warmup = 1000,
+  iter_sampling = 3000,
+  refresh = 0,
+  max_treedepth = 10,
+  adapt_delta = 0.80
+)
+
+```
+
+
+Create Loo objects
+```{r}
+Loo_simpleBayes <- simpleBayes_fit$loo(save_psis = TRUE, cores = 4)
+
+Loo_weightedBayes <- weightedBayes_fit$loo(save_psis = TRUE, cores = 4)
+```
+
+PSIS diagnostic plot
+```{r}
+plot(Loo_simpleBayes)
+plot(Loo_weightedBayes)
+```
+
+
+
+Create differentiated elpd
+```{r}
+elpd <- tibble(
+  n = seq(length(cogsci_d$SecondRating)),
+  differentiated_elpd = 
+  Loo_simpleBayes$pointwise[, "elpd_loo"] - 
+  Loo_weightedBayes$pointwise[, "elpd_loo"]
+  )
+```
+
+
+Plot the differentiated elpd
+```{r}
+elpd %>% ggplot(aes(x = n, y = differentiated_elpd)) +
+  geom_point(alpha = .1) +
+  #xlim(.5,1.01) +
+  #ylim(-1.5,1.5) +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  theme_minimal()
+```
+
+
+
+Make Loo comparison
+```{r}
+loo_compare(Loo_simpleBayes, Loo_weightedBayes)
+```
+
+Get model weights (how much do we gain from using a second model to explain the data - ish)
+```{r}
+loo_model_weights(list(Loo_weightedBayes, Loo_simpleBayes))
+```
+
