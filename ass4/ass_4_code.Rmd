@@ -1,0 +1,707 @@
+---
+title: "Assignment 4"
+author: "Andreas"
+date: "2024-04-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(data.table)
+library(tidyverse)
+library(ggplot2)
+library(patchwork)
+library(cmdstanr)
+library(posterior)
+```
+
+
+
+In this markdown
+
+- Simulate task environment
+- Create agent and simulate data
+- Inspect simulated behaviour
+- Fit Stan model to simulated data
+  - Fit quality check
+- Fit Stan model to empirical data
+  - Fit quality check
+  
+
+### Simulate task environt
+
+```{r}
+n <- 5
+l <- rep(list(0:1), n)
+stim <- expand.grid(l)
+
+stim$dangerous <- ifelse(stim$Var1 == 1 | stim$Var2 == 1, 1, 0) # try with or here
+stim$nutricious <- ifelse(stim$Var4 == 1, 1, 0)
+stim$category <- ifelse(stim$dangerous == 0 & stim$nutricious == 0, 1,
+                        ifelse(stim$dangerous == 0 & stim$nutricious == 1, 2,
+                               ifelse(stim$dangerous == 1 & stim$nutricious == 0, 3, 4)))
+
+
+stim_full <- data.frame()
+
+for (i in 1:3){ # try 6
+  stim_full <- rbind(stim_full, stim[sample(nrow(stim)),])
+}
+
+stim_full$response = NA
+
+
+```
+
+
+### Create agent
+
+```{r}
+# GCM_f <- function(c, w1, w2, w3, w4, w5, data){
+#   data$response <- NA
+#   
+#   ntrials <- nrow(data)
+#   
+#   categories <- c(1,2,3,4)
+#   
+#   observed <- c()
+#   
+#   pos <- array(NA, dim=c(4,5)) # position array to update. Dimension 4, because we have 4 categories
+#   
+#   
+#   
+#   for (t in 1:ntrials){
+#     if (sum(c(1,2,3,4) %in% observed != 4)){ # We check if each category has been observed. We need 4 TRUEs
+#       data$response[t] <- sample(categories, 1, replace = TRUE) # If we havent observed all cats, we guess
+#     }
+#     else{
+#       cat_dist <- array(NA, dim=4) # Distance to each category, empty array
+#       cat_sim <- array(NA, dim=4) # Similarity with each category, empty array
+#       
+#       for (cat in 1:4){
+#         fwise_dist <- array(NA, dim=5)
+#         
+#         fwise_dist[1] <- data$Var1[r] - pos[cat,1]
+#         fwise_dist[2] <- data$Var2[r] - pos[cat,2]
+#         fwise_dist[3] <- data$Var3[r] - pos[cat,3]
+#         fwise_dist[4] <- data$Var4[r] - pos[cat,4]
+#         fwise_dist[5] <- data$Var5[r] - pos[cat,5]
+#         
+#         # Calculate overall distance to category
+#         cat_dist[cat] <- sqrt(w1*fwise_dist[1]^2 + w2*fwise_dist[2]^2
+#                               + w3*fwise_dist[3]^2 + w4*fwise_dist[4]^2 + w5*fwise_dist[5]^2)
+#         
+#         # Calculate similarity to category
+#         cat_sim[cat] <- exp(-c*cat_dist[cat])
+#         
+#         # burde vi dele beslutningen op i to? dvs først regne sim ift danger og derefter regne sim ift nutrition? hmmmm
+#         }
+#       }
+# 
+#       
+#       
+#     }
+#     # Update pos
+#   }
+# }
+```
+
+
+
+### Create agent take 2
+
+```{r}
+GCM_f <- function(c, weights, data, R){
+  
+  data$response <- NA
+  
+  ntrials <- nrow(data)
+  
+  #categories <- c("d0", "d1", "n0", "n1")
+  
+  observed <- c()
+  
+  # We need arrays for both P and K (for all 4 categories), so we can go back.
+  # We must also copy the old position value into the current trial, if that category is not updated
+  
+  dang0_pos <- array(NA, dim=c(ntrials+1,5))
+  dang1_pos <- array(NA, dim=c(ntrials+1,5))
+  nutr0_pos <- array(NA, dim=c(ntrials+1,5))
+  nutr1_pos <- array(NA, dim=c(ntrials+1,5))
+  
+  # Defining initial position as 0.5 on all features axes
+  dang0_pos[1,] <- rep(0.5, 5)
+  dang1_pos[1,] <- rep(0.5, 5)
+  nutr0_pos[1,] <- rep(0.5, 5)
+  nutr1_pos[1,] <- rep(0.5, 5)
+  
+  # Defining K arrays (gain)
+  # We dont need initial values for these, just that the arrays are same length
+  dang0_K <- array(NA, dim = ntrials+1)
+  dang1_K <- array(NA, dim = ntrials+1)
+  nutr0_K <- array(NA, dim = ntrials+1)
+  nutr1_K <- array(NA, dim = ntrials+1) 
+  
+  # Defining P arrays
+  dang0_P <- array(NA, dim = ntrials+1)
+  dang1_P <- array(NA, dim = ntrials+1)
+  nutr0_P <- array(NA, dim = ntrials+1)
+  nutr1_P <- array(NA, dim = ntrials+1)
+  
+  # Initial values of P are set to 1
+  dang0_P[1] <- 1
+  dang1_P[1] <- 1
+  nutr0_P[1] <- 1
+  nutr1_P[1] <- 1
+  
+  # Define distance function
+  distance <- function(vec1, vec2, weights){
+    return(sqrt(sum(weights * abs(vec1 - vec2)^2)))
+  }
+  
+  # Define similarity function
+  similarity <- function(distance, c){
+    return(exp(-c * distance))
+  }
+  
+  for (t in 1:ntrials){
+    
+    # The current alien; list of the features it has
+    alien <- array(c(data$Var1[t],
+                     data$Var2[t],
+                     data$Var3[t],
+                     data$Var4[t],
+                     data$Var5[t]))
+    
+    if ("n1" %in% observed & "n0" %in% observed){
+       # Calculate distances for the nutrition axis
+      nutr0_dist <- distance(alien, nutr0_pos[t,], weights)
+      nutr1_dist <- distance(alien, nutr1_pos[t,], weights)
+      
+      nutr0_sim <- similarity(nutr0_dist, c)
+      nutr1_sim <- similarity(nutr1_dist, c)
+      
+      resp_nutr <- rbinom(1,1, nutr1_sim / (nutr1_sim + nutr0_sim))
+      
+    }
+    else{
+      resp_nutr <- rbinom(1,1, 0.5)
+    }
+    
+    if ("d1" %in% observed & "d0" %in% observed) {
+      # Calculate distances for the danger axis
+      dang0_dist <- distance(alien, dang0_pos[t,], weights)
+      dang1_dist <- distance(alien, dang1_pos[t,], weights)
+      
+      # Calculate similarities
+      dang0_sim <- similarity(dang0_dist, c)
+      dang1_sim <- similarity(dang1_dist, c)
+      
+      # Now code the response. We decide danger and nutrition seperately
+      resp_dang <- rbinom(1,1, dang1_sim / (dang1_sim + dang0_sim))
+ 
+    }
+    else{
+      resp_dang <- rbinom(1,1,0.5)
+    }
+    
+    data$response[t] <- 1 + resp_nutr + 2 * resp_dang
+
+    # append category to observed list
+    observed <- c(observed, ifelse(data$dangerous[t] == 1, "d1", "d0"))
+    observed <- c(observed, ifelse(data$nutricious[t] == 1, "n1", "n0"))
+    
+    # Update positions using Kalman filter
+
+    # Update each of the four positions individually, as they are in principle independent.
+    # Their independence is not clear, when we are in binary space, but on a continuous space, there could
+    # be a sweetspot that meant danger. You could also imagine that eyes on stalk means danger sometimes
+    # and eyes on stalk in combination with a specific other feature means not danger. Then the position of
+    # both dang1 and dang0 would be towards the 1 end of the eyes on stalk axis.
+    
+    # Shifting the index with 1, so we can always go backwards
+    k = t + 1
+    
+    if (data$dangerous[t] == 1){
+      #kalman update dang1_pos
+      dang1_K[k] = dang1_P[k-1] / (dang1_P[k-1] + R) # gain
+      dang1_pos[k,] = dang1_pos[k-1,] + dang1_K[k] * (alien - dang1_pos[k-1,]) # update position
+      dang1_P[k] = (1 - dang1_K[k]) * dang1_P[k-1] # update P
+      
+      
+      #repeat values for dang0
+      dang0_K[k] = dang0_K[k-1]
+      dang0_pos[k,] = dang0_pos[k-1,]
+      dang0_P[k] = dang0_P[k-1]
+      
+    }
+    else{
+      #kalman update dang0_pos
+      dang0_K[k] = dang0_P[k-1] / (dang0_P[k-1] + R) # gain
+      dang0_pos[k,] = dang0_pos[k-1,] + dang0_K[k] * (alien - dang0_pos[k-1,]) # update position
+      dang0_P[k] = (1 - dang0_K[k]) * dang0_P[k-1] # update P
+      
+      
+      #repeat values for dang1
+      dang1_K[k] = dang1_K[k-1]
+      dang1_pos[k,] = dang1_pos[k-1,]
+      dang1_P[k] = dang1_P[k-1]
+
+    }
+    
+    
+    if (data$nutricious[t] == 1){
+      #kalman update nutr1_pos
+      nutr1_K[k] = nutr1_P[k-1] / (nutr1_P[k-1] + R) # gain
+      nutr1_pos[k,] = nutr1_pos[k-1,] + nutr1_K[k] * (alien - nutr1_pos[k-1,]) # update position
+      nutr1_P[k] = (1 - nutr1_K[k]) * nutr1_P[k-1] # update P
+      
+      
+      #repeat values for nutr0
+      nutr0_K[k] = nutr0_K[k-1]
+      nutr0_pos[k,] = nutr0_pos[k-1,]
+      nutr0_P[k] = nutr0_P[k-1]
+    }
+    else{
+      #kalman update nutr0_pos
+      nutr0_K[k] = nutr0_P[k-1] / (nutr0_P[k-1] + R) # gain
+      nutr0_pos[k,] = nutr0_pos[k-1,] + nutr0_K[k] * (alien - nutr0_pos[k-1,]) # update position
+      nutr0_P[k] = (1 - nutr0_K[k]) * nutr0_P[k-1] # update P
+      
+      
+      #repeat values for nutr1
+      nutr1_K[k] = nutr1_K[k-1]
+      nutr1_pos[k,] = nutr1_pos[k-1,]
+      nutr1_P[k] = nutr1_P[k-1]
+    }
+    
+  }
+  return(list(data = data,
+              dang1_pos = dang1_pos,
+              dang0_pos = dang0_pos,
+              nutr1_pos = nutr1_pos,
+              nutr0_pos = nutr0_pos))
+}
+```
+
+
+Simulate data
+
+```{r}
+c = 3.5 # Higher c -> more deterministic. We need pretty high c, for agent to perform above chance
+weights = array(rep(0.2, 5))
+R = 10 # Slow learning
+#R = 0.1 # Fast learning
+sim <- GCM_f(c, weights, stim_full, R)
+
+sim_d <- sim$data
+
+dang1_d <- as.data.frame(sim$dang1_pos)
+dang0_d <- as.data.frame(sim$dang0_pos)
+nutr1_d <- as.data.frame(sim$nutr1_pos)
+nutr0_d <- as.data.frame(sim$nutr0_pos)
+
+```
+
+
+
+Visualize positions over time
+
+```{r}
+p1 <- dang1_d %>% mutate(trial = seq(length(dang1_d$V1))) %>%
+  mutate(V2 = V2 - 0.008) %>% 
+  pivot_longer(cols = c(V1, V2, V3, V4, V5), values_to = "position", names_to = "feature") %>% 
+  ggplot() +
+  geom_line(aes(x = trial, y = position, color = feature), alpha = 0.5, size = 1.5) +
+  ggtitle("Dang1")
+
+
+p2 <- dang0_d %>% mutate(trial = seq(length(dang0_d$V1))) %>%
+  mutate(V2 = V2 - 0.008) %>% 
+  pivot_longer(cols = c(V1, V2, V3, V4, V5), values_to = "position", names_to = "feature") %>% 
+  ggplot() +
+  geom_line(aes(x = trial, y = position, color = feature), alpha = 0.5, size = 1.5)+
+  ggtitle("Dang0")
+
+
+p3 <- nutr1_d %>% mutate(trial = seq(length(nutr1_d$V1))) %>%
+  pivot_longer(cols = c(V1, V2, V3, V4, V5), values_to = "position", names_to = "feature") %>% 
+  ggplot() +
+  geom_line(aes(x = trial, y = position, color = feature), alpha = 0.5, size = 1.5) +
+  ggtitle("Nutr1")
+
+
+p4 <- nutr0_d %>% mutate(trial = seq(length(nutr0_d$V1))) %>%
+  pivot_longer(cols = c(V1, V2, V3, V4, V5), values_to = "position", names_to = "feature") %>% 
+  ggplot() +
+  geom_line(aes(x = trial, y = position, color = feature), alpha = 0.5, size = 1.5)+
+  ggtitle("Nutr0")
+
+(p1 + p2) / (p3 + p4)
+
+```
+
+
+```{r}
+# write.csv(dang0_d, "dang0.csv")
+# write.csv(dang1_d, "dang1.csv")
+# write.csv(nutr0_d, "nutr0.csv")
+# write.csv(nutr1_d, "nutr1.csv")
+```
+
+
+Visualize proportion of correct over time
+
+```{r}
+sim_d$correct <-ifelse(sim_d$response == sim_d$category, 1, 0)
+
+sim_d$cummulativeRate <- cumsum(sim_d$correct) / seq_along(sim_d$correct)
+
+sim_d %>% ggplot(aes(x = seq_along(cummulativeRate), y = cummulativeRate)) +
+  geom_line() +
+  ggtitle("Cummulative Rate") +
+  xlab("Trial") +
+  theme_minimal()
+
+```
+
+
+### Simulation with various combinations for R and C parameters
+
+
+```{r}
+Rs <- c(0.1, 0.5, 0.75, 1, 1.5, 2, 2.5, 3, 3.5, 5, 10)
+Cs <- c(1, 1.5, 2, 2.5, 3, 3.5, 4)
+weights = array(rep(0.2, 5))
+
+d <- data.frame()
+
+for (R in Rs){
+  for (c in Cs){
+    sim_temp <- GCM_f(c, weights, stim_full, R) # Simulate data
+    temp_d <- sim_temp$data
+    
+    temp_d$correct <-ifelse(temp_d$response == temp_d$category, 1, 0)
+    temp_d$cumulativeRate <- cumsum(temp_d$correct) / seq_along(temp_d$correct) # calc cummulative rate
+    
+    temp_d$R <- R
+    temp_d$c <- c
+    temp_d$Trial <- seq_along(temp_d$correct)
+    
+    d <- rbind(d, temp_d)
+    
+  }
+}
+
+```
+
+
+Visualize performance by R and c
+
+```{r}
+d %>%
+  ggplot(aes(x = Trial, y = cumulativeRate, group = c, color = c)) +
+  geom_line() +
+  geom_hline(yintercept = 0.25, linetype = "dashed", color = "red") +
+  facet_wrap(~R) +
+  ggtitle("CumulativeRate - facets by R") +
+  theme_minimal()
+
+d %>%
+  ggplot(aes(x = Trial, y = cumulativeRate, group = R, color = R)) +
+  geom_line() +
+  geom_hline(yintercept = 0.25, linetype = "dashed", color = "red") +
+  facet_wrap(~c) +
+  ggtitle("CumulativeRate - facets by c") +
+  theme_minimal()
+```
+
+
+### Fit model to simulated data
+
+
+```{r}
+# prepare data
+w_prior_values = c(rep(0.2, 5))
+ntrials = length(sim_d$Var1)
+nfeats = 5
+stimuli = array(NA, dim = c(ntrials, nfeats))
+stimuli[,1] = sim_d$Var1
+stimuli[,2] = sim_d$Var2
+stimuli[,3] = sim_d$Var3
+stimuli[,4] = sim_d$Var4
+stimuli[,5] = sim_d$Var5
+
+# prepare model
+model_file = file.path("C:/Users/andre/OneDrive - Aarhus universitet/Cognitive Science/Kandidat/Advanced Cognitive Modeling/Assignments/Ass4/ass_4_GCMKalman.stan")
+
+gcm_kalman_mod <- cmdstan_model(model_file)
+
+data <- list(
+  ntrials = ntrials,
+  nfeats = nfeats,
+  stimuli = stimuli,
+  response = sim_d$response,
+  dangerous = sim_d$dangerous,
+  nutricious = sim_d$nutricious,
+  w_prior_values = w_prior_values
+)
+
+# fit model
+
+samples <- gcm_kalman_mod$sample(
+  data = data,
+  seed = 123,
+  chains = 3,
+  iter_warmup = 1000,
+  iter_sampling = 3000,
+  refresh = 0,
+  max_treedepth = 10,
+  adapt_delta = 0.80
+)
+```
+inspect posteriors
+```{r}
+draws <- as_draws_df(samples$draws())
+```
+
+
+```{r}
+draws %>% ggplot +
+  geom_density(aes(x = logit_c), color = "red", fill = "red", alpha = 0.2) +
+  geom_density(aes(x = logit_c_prior), color = "blue", fill = "blue", alpha = 0.2) +
+  theme_minimal()
+
+draws %>% ggplot +
+  geom_density(aes(x = log_R), color = "red", fill = "red", alpha = 0.2) +
+  geom_density(aes(x = log_R_prior), color = "blue", fill = "blue", alpha = 0.2) +
+  theme_minimal()
+
+draws %>% ggplot +
+  geom_density(aes(x = c), color = "red", fill = "red", alpha = 0.2) +
+  geom_density(aes(x = c_prior), color = "blue", fill = "blue", alpha = 0.2) +
+  theme_minimal()
+
+draws %>% ggplot +
+  geom_density(aes(x = R), color = "red", fill = "red", alpha = 0.2) +
+  geom_density(aes(x = R_prior), color = "blue", fill = "blue", alpha = 0.2) +
+  theme_minimal()
+
+w1p <- draws %>% ggplot +
+  geom_density(aes(x = `w[1]`), color = "red", fill = "red", alpha = 0.2) +
+  geom_density(aes(x = `w_prior[1]`), color = "blue", fill = "blue", alpha = 0.2) +
+  theme_minimal()
+w2p <- draws %>% ggplot +
+  geom_density(aes(x = `w[2]`), color = "red", fill = "red", alpha = 0.2) +
+  geom_density(aes(x = `w_prior[2]`), color = "blue", fill = "blue", alpha = 0.2) +
+  theme_minimal()
+w3p <- draws %>% ggplot +
+  geom_density(aes(x = `w[3]`), color = "red", fill = "red", alpha = 0.2) +
+  geom_density(aes(x = `w_prior[3]`), color = "blue", fill = "blue", alpha = 0.2) +
+  theme_minimal()
+w4p <- draws %>% ggplot +
+  geom_density(aes(x = `w[4]`), color = "red", fill = "red", alpha = 0.2) +
+  geom_density(aes(x = `w_prior[4]`), color = "blue", fill = "blue", alpha = 0.2) +
+  theme_minimal()
+w5p <- draws %>% ggplot +
+  geom_density(aes(x = `w[5]`), color = "red", fill = "red", alpha = 0.2) +
+  geom_density(aes(x = `w_prior[5]`), color = "blue", fill = "blue", alpha = 0.2) +
+  theme_minimal()
+
+w1p+w2p+w3p+w4p+w5p
+
+draws %>% ggplot() +
+  geom_point(aes(x = log_R, y = logit_c))
+
+draws %>% ggplot() +
+  geom_point(aes(x = log_R, y = `w[1]`))
+
+draws %>% ggplot() +
+  geom_point(aes(x = log_R, y = `w[2]`))
+draws %>% ggplot() +
+  geom_point(aes(x = log_R, y = `w[3]`))
+draws %>% ggplot() +
+  geom_point(aes(x = log_R, y = `w[4]`))
+draws %>% ggplot() +
+  geom_point(aes(x = log_R, y = `w[5]`))
+
+```
+
+Check chains
+```{r}
+tp1 <- draws %>% ggplot() +
+  geom_line(aes(x = .iteration, y = logit_c, group = .chain, color = .chain)) +
+  theme_minimal()
+tp2 <- draws %>% ggplot() +
+  geom_line(aes(x = .iteration, y = log_R, group = .chain, color = .chain)) +
+  theme_minimal()
+tp3 <- draws %>% ggplot() +
+  geom_line(aes(x = .iteration, y = `w[1]`, group = .chain, color = .chain)) +
+  theme_minimal()
+tp4 <- draws %>% ggplot() +
+  geom_line(aes(x = .iteration, y = `w[2]`, group = .chain, color = .chain)) +
+  theme_minimal()
+tp5 <- draws %>% ggplot() +
+  geom_line(aes(x = .iteration, y = `w[3]`, group = .chain, color = .chain)) +
+  theme_minimal()
+tp6 <- draws %>% ggplot() +
+  geom_line(aes(x = .iteration, y = `w[4]`, group = .chain, color = .chain)) +
+  theme_minimal()
+tp7 <- draws %>% ggplot() +
+  geom_line(aes(x = .iteration, y = `w[5]`, group = .chain, color = .chain)) +
+  theme_minimal()
+
+(tp1 + tp2) / (tp3 + tp4) / (tp5 + tp6) / tp7
+
+```
+
+### Fit model to empirical data ###
+
+
+```{r}
+empirical_d <- read.csv("AlienData.txt")
+```
+
+Preprocess empirical data
+
+```{r}
+emp_d <- empirical_d %>% 
+  filter(session == 1) %>% 
+  mutate("f1" = substr(stimulus, 1, 1),
+         "f2" = substr(stimulus, 2, 2),
+         "f3" = substr(stimulus, 3, 3),
+         "f4" = substr(stimulus, 4, 4),
+         "f5" = substr(stimulus, 5, 5))
+emp_d$subject <- paste(emp_d$condition, emp_d$subject, sep = "_")
+
+```
+
+
+Now we fit to each participant
+
+```{r}
+IDs <- unique(emp_d$subject)
+
+draws_all <- data.frame()
+
+for (ID in IDs){
+  this_ID <- ID
+  
+  temp_d <- emp_d %>% filter(subject == this_ID)
+  
+  # prepare data
+  w_prior_values = c(rep(0.2, 5))
+  ntrials = length(temp_d$f1)
+  nfeats = 5
+  stimuli = array(NA, dim = c(ntrials, nfeats))
+  stimuli[,1] = temp_d$f1
+  stimuli[,2] = temp_d$f2
+  stimuli[,3] = temp_d$f3
+  stimuli[,4] = temp_d$f4
+  stimuli[,5] = temp_d$f5
+  
+  temp_data <- list(
+    ntrials = ntrials,
+    nfeats = nfeats,
+    stimuli = stimuli,
+    response = temp_d$response,
+    dangerous = temp_d$dangerous,
+    nutricious = temp_d$nutricious,
+    w_prior_values = w_prior_values
+    )
+  
+  # fit model
+  
+  temp_samples <- gcm_kalman_mod$sample(
+    data = temp_data,
+    seed = 123,
+    chains = 3,
+    parallel_chains = 3,
+    iter_warmup = 1000,
+    iter_sampling = 3000,
+    refresh = 0,
+    max_treedepth = 10,
+    adapt_delta = 0.80
+  )
+  
+  temp_draws <- as_draws_df(temp_samples$draws()) # get draws df
+  
+  temp_draws$ID = this_ID
+  
+  temp_draws <- temp_draws %>% select(c, R, logit_c, log_R, c_prior, R_prior, logit_c_prior, log_R_prior,
+                                      `w[1]`, `w[2]`, `w[3]`, `w[4]`, `w[5]`, .chain, .iteration, ID)
+  
+  draws_all <- rbind(draws_all, temp_draws) # save the draws from this participant
+  
+  print("Participant")
+  print(ID)
+  print("completed")
+}
+
+## Error: cannot allocate vector of size 431.7 Mb
+## It got through 14 participants
+```
+save draws_all
+
+```{r}
+save(draws_all, file="draws_all_52subs.RData")
+```
+
+
+
+Plot posteriors
+
+```{r}
+library(ggridges)
+
+
+draws_all$ID <- as.factor(draws_all$ID)
+draws_all %>% ggplot() +
+  geom_density_ridges(aes(x = R, y = ID, fill = ID), rel_min_height = 0.01) +
+  xlim(c(0,5)) +
+  theme_minimal()
+
+draws_all %>% ggplot() +
+  geom_density_ridges(aes(x = c, y = ID, fill = ID), rel_min_height = 0.01) +
+  xlim(c(2.5, 4.2)) +
+  theme_minimal()
+
+w1p2 <- draws_all %>% ggplot() +
+  geom_density_ridges(aes(x = `w[1]`, y = ID, fill = ID)) +
+  xlim(c(0,1)) +
+  theme_minimal()
+w2p2 <- draws_all %>% ggplot() +
+  geom_density_ridges(aes(x = `w[2]`, y = ID, fill = ID)) +
+  xlim(c(0,1)) +
+  theme_minimal()
+w3p2 <- draws_all %>% ggplot() +
+  geom_density_ridges(aes(x = `w[3]`, y = ID, fill = ID)) +
+  xlim(c(0,1)) +
+  theme_minimal()
+w4p2 <- draws_all %>% ggplot() +
+  geom_density_ridges(aes(x = `w[4]`, y = ID, fill = ID)) +
+  xlim(c(0,1)) +
+  theme_minimal()
+w5p2 <- draws_all %>% ggplot() +
+  geom_density_ridges(aes(x = `w[5]`, y = ID, fill = ID)) +
+  xlim(c(0,1)) +
+  theme_minimal()
+
+w1p2
+w2p2
+w3p2
+w4p2
+w5p2
+
+
+
+```
+
+
+
+
+
+
